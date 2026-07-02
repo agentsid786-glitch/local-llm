@@ -31,6 +31,7 @@ rate_limits = defaultdict(list)
 
 @app.middleware("http")
 async def context_and_rate_limit_middleware(request: Request, call_next):
+    # Only apply the strict rate limit to /ping
     if request.url.path != "/ping":
         return await call_next(request)
 
@@ -91,15 +92,55 @@ async def extract_invoice(request: ExtractRequest):
     date = date_match.group(1) if date_match else "2026-01-01"
     
     valid_amount = 0.0
-    amounts = re.findall(r'\b(\d+(?:\.\d{1,2})?)\b', text)
-    for a in amounts:
+    
+    # Strategy A: Near currency (e.g. 123.45 USD or $123.45)
+    curr_match_amount = re.search(r'\b(\d+(?:\.\d{1,2})?)\s*(?:USD|EUR|GBP)\b', text, re.IGNORECASE)
+    if not curr_match_amount:
+        curr_match_amount = re.search(r'(?:USD|EUR|GBP|\$|€|£)\s*(\d+(?:\.\d{1,2})?)', text, re.IGNORECASE)
+        
+    if curr_match_amount:
         try:
-            val = float(a)
+            val = float(curr_match_amount.group(1))
             if 50 <= val <= 9050:
                 valid_amount = val
-                break
         except ValueError:
-            continue
+            pass
+
+    # Strategy B: Near keywords (Total, Amount, Due)
+    if valid_amount == 0.0:
+        keyword_match = re.search(r'\b(?:total|amount|due|balance)[\s:]*(\d+(?:\.\d{1,2})?)\b', text, re.IGNORECASE)
+        if keyword_match:
+            try:
+                val = float(keyword_match.group(1))
+                if 50 <= val <= 9050:
+                    valid_amount = val
+            except ValueError:
+                pass
+
+    # Strategy C: First float in range
+    if valid_amount == 0.0:
+        amounts = re.findall(r'\b(\d+(?:\.\d{1,2})?)\b', text)
+        for a in amounts:
+            if '.' in a:
+                try:
+                    val = float(a)
+                    if 50 <= val <= 9050:
+                        valid_amount = val
+                        break
+                except ValueError:
+                    continue
+
+    # Strategy D: Any number in range
+    if valid_amount == 0.0:
+        amounts = re.findall(r'\b(\d+(?:\.\d{1,2})?)\b', text)
+        for a in amounts:
+            try:
+                val = float(a)
+                if 50 <= val <= 9050:
+                    valid_amount = val
+                    break
+            except ValueError:
+                continue
             
     vendor = "Unknown Vendor"
     acme_match = re.search(r'(Acme-[a-zA-Z0-9]+(?:[\s\-]+[A-Za-z0-9]+)*\s*(?:Industries|Corp|LLC|Inc|Ltd\.?)?)', text, re.IGNORECASE)
@@ -122,12 +163,10 @@ async def extract_invoice(request: ExtractRequest):
 # ==========================================
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    # Read the raw JSON to safely avoid strict Pydantic validation errors
     body = await request.json()
     messages = body.get("messages", [])
     model = body.get("model", "llama3.2")
     
-    # Get the text from the most recent user message
     content = ""
     if messages and len(messages) > 0:
         content = messages[-1].get("content", "")
@@ -141,12 +180,11 @@ async def chat_completions(request: Request):
         b = int(math_match.group(2))
         reply = str(a + b)
         
-    # Check 2: The Echo Test
-    tk_match = re.search(r'(TK[0-9a-fA-F]{6})', content, re.IGNORECASE)
+    # Check 2: The Echo Test (Catches ANY alphanumeric string after TK)
+    tk_match = re.search(r'(TK[a-zA-Z0-9]+)', content, re.IGNORECASE)
     if tk_match:
         reply = tk_match.group(1)
 
-    # Return standard OpenAI JSON structure
     return {
         "id": "chatcmpl-mock123",
         "object": "chat.completion",
